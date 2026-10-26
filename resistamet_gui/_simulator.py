@@ -55,6 +55,19 @@ _CANONICAL_ELEMS = ("VOLT", "CURR", "RES", "TIME", "STAT")
 # Note: this is NOT the same as the Measurement Event Register's compliance
 # bit (+114 / bit 14). The FORM:ELEM STAT element uses a different bit layout.
 _STAT_BIT_COMPLIANCE = 1 << 3
+_STAT_BIT_RANGE_COMPLIANCE = 1 << 16
+
+# Measure ranges (full scale, as :SENS:...:RANG? reports them on a 2410).
+# A request snaps to the smallest range >= the value, like the hardware.
+_CURR_RANGES = (1.05e-6, 1.05e-5, 1.05e-4, 1.05e-3, 1.05e-2, 1.05e-1, 1.05)
+_VOLT_RANGES = (0.21, 2.1, 21.0, 210.0)
+
+
+def _snap_range(value: float, ranges: tuple) -> float:
+    for r in ranges:
+        if abs(value) <= r:
+            return r
+    return ranges[-1]
 
 # Per-function STAT baseline values observed on the Keithley 2420 (firmware
 # C30) with our 100Ω DUT. These are the bits that the instrument sets to
@@ -160,6 +173,7 @@ _SETTABLE: dict[str, tuple[str, str]] = {
     ":TRIG:COUN":             ("trig_coun", "int"),
     ":TRIG:DEL":              ("trig_del", "float"),
     ":OUTP:SMOD":             ("outp_smod", "smod"),
+    ":SOUR:CLE:AUTO":         ("sour_cle_auto", "bool"),
 }
 
 
@@ -201,6 +215,7 @@ _QUERY_TO_KEY: dict[str, tuple[str, str]] = {
     ":TRIG:DEL?":              ("trig_del", "del"),
     ":OUTP?":                  ("outp", "bool_str"),
     ":OUTP:SMOD?":             ("outp_smod", "raw"),
+    ":SOUR:CLE:AUTO?":         ("sour_cle_auto", "bool_str"),
 }
 
 
@@ -334,6 +349,7 @@ class FakeKeithley:
             "form_elem": list(_CANONICAL_ELEMS),
             "outp": False,
             "outp_smod": "NORM",
+            "sour_cle_auto": False,
         }
         self._error_queue: deque[tuple[int, str]] = deque()
 
@@ -498,6 +514,24 @@ class FakeKeithley:
         self._queue_error(-113, "Undefined header")
 
     def _apply_settable(self, key: str, kind: str, arg: str) -> None:
+        if key in ("sens_curr_rang", "sens_volt_rang"):
+            # Fixed measure range: snap to a real range, never above the
+            # range of the compliance limit (hardware error 824).
+            try:
+                req = _parse_float(arg)
+            except (ValueError, TypeError):
+                self._queue_error(-220, "Parameter error")
+                return
+            if key == "sens_curr_rang":
+                ranges, prot = _CURR_RANGES, self.state["sens_curr_prot"]
+            else:
+                ranges, prot = _VOLT_RANGES, self.state["sens_volt_prot"]
+            rang, cap = _snap_range(req, ranges), _snap_range(prot, ranges)
+            if rang > cap:
+                self._queue_error(824, "Cannot exceed compliance range")
+                rang = cap
+            self.state[key] = rang
+            return
         try:
             if kind == "bool":
                 self.state[key] = _parse_bool(arg)
@@ -618,12 +652,19 @@ class FakeKeithley:
               source value.
         """
         in_compliance = False
+        self._range_compliance = False
         r = self.dut_resistance
         if self.state["sour_func"] == "VOLT":
             requested_v = source_value
             ideal_i = (requested_v - self.dut_voltage_offset) / r if r != 0 else float("inf")
             i_limit = abs(self.state["sens_curr_prot"])
-            if abs(ideal_i) > i_limit:
+            rang = self.state["sens_curr_rang"]
+            if (not self.state["sens_curr_rang_auto"] and rang < i_limit
+                    and abs(ideal_i) > rang):
+                # Fixed range below compliance: the range limits the current.
+                self._range_compliance = True
+                measured_i = math.copysign(rang, ideal_i)
+            elif abs(ideal_i) > i_limit:
                 in_compliance = True
                 measured_i = math.copysign(i_limit, ideal_i)
             else:
@@ -674,6 +715,8 @@ class FakeKeithley:
         v, i, r, comp = self._compute_one_point(source_value)
         baseline = _STAT_BASELINE.get(self._mode_tag(), _STAT_BASELINE["default"])
         stat = baseline | (_STAT_BIT_COMPLIANCE if comp else 0)
+        if self._range_compliance:
+            stat |= _STAT_BIT_RANGE_COMPLIANCE
         return self._format_elements(v, i, r, stat)
 
     def _compute_sweep_read(self) -> str:

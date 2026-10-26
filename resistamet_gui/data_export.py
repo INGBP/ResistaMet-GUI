@@ -211,9 +211,16 @@ def get_column_config(mode: str, measurement_settings: Optional[Dict[str, Any]] 
             ['elapsed_s', 'V', 'I', 'V_over_I', 'Rs_ohm_sq', 'rho_ohm_cm', 'sigma_S_cm', 'V_unc_V', 'I_unc_A', 'compliance', 'event'],
             ['s', 'V', 'A', 'Ω', 'Ω/□', 'Ω·cm', 'S/cm', 'V', 'A', '', '']
         ),
+        # power = |V·I| per point, energy_cum = running Σ power·on-time,
+        # energy_win = energy in the limiter window after this point,
+        # wait = time held at 0 by the energy limit before this point,
+        # setpoint = the programmed source level (V_source/I_meas are what
+        # the instrument returned), range = fixed measure range chosen by
+        # the software ranging (NaN for the hardware sweep).
         'sweep': (
-            ['point', 'V_source', 'I_meas', 'compliance'],
-            ['', 'V', 'A', '']
+            ['point', 'V_source', 'I_meas', 'compliance', 'power', 'energy_cum',
+             'energy_win', 'wait', 'setpoint', 'range'],
+            ['', 'V', 'A', '', 'W', 'J', 'J', 's', '', '']
         ),
         # Van der Pauw (F76 Method A): 4 rows, one per physical geometry.
         # Each row captures both polarities of that geometry; the summary
@@ -338,6 +345,10 @@ def build_metadata(
             'compliance': measurement_settings.get('sweep_compliance'),
             'delay_s': measurement_settings.get('sweep_delay'),
             'direction': measurement_settings.get('sweep_direction'),
+            'meas_time_s': measurement_settings.get('sweep_meas_time'),
+            'energy_limit_j': measurement_settings.get('sweep_energy_limit'),
+            'energy_window_s': measurement_settings.get('sweep_energy_window'),
+            'point_by_point': measurement_settings.get('sweep_point_by_point'),
         }
 
     return meta

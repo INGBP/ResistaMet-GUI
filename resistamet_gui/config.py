@@ -77,6 +77,17 @@ class ConfigManager:
                 measurement.pop('gpib_address', None)
         self.save_config()
 
+    def get_machine_setting(self, key: str, default=None):
+        """Read a per-machine value (e.g. last identified instrument model)."""
+        return self._machine_entry().get(key, default)
+
+    def set_machine_setting(self, key: str, value) -> None:
+        """Persist a per-machine value; saves only if it changed."""
+        entry = self._machine_entry(create=True)
+        if entry.get(key) != value:
+            entry[key] = value
+            self.save_config()
+
     def _migrate_machine_local(self) -> bool:
         entry = self._machine_entry()
         if 'gpib_address' in entry:

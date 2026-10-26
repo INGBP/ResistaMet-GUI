@@ -1,6 +1,9 @@
+import re
+
 import numpy as np
 import pyqtgraph as pg
 from matplotlib.figure import Figure
+from matplotlib.ticker import EngFormatter
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -478,7 +481,13 @@ class PgLiveCanvas(QWidget):
 
 
 class IVCanvas(FigureCanvas):
-    """X-Y plot for I-V sweep data (not time-series)."""
+    """X-Y plot for I-V sweep data (not time-series).
+
+    Tick labels use engineering prefixes (``20 mA``); the unit in an axis
+    label like "Current (A)" moves into the ticks. ``set_swapped`` exchanges
+    the X and Y axes (data and labels) and survives clear_plot(); callers
+    always pass data in natural (source, measured) order.
+    """
 
     def __init__(self, parent=None, width=8, height=5, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi, constrained_layout=True)
@@ -489,15 +498,17 @@ class IVCanvas(FigureCanvas):
                 self.setParent(parent)
             except Exception:
                 pass
-        self.axes.set_xlabel('Voltage (V)')
-        self.axes.set_ylabel('Current (A)')
-        self.axes.set_title('I-V Characteristic')
-        self.axes.grid(True)
+        self._swapped = False
+        self._labels = ('Voltage (V)', 'Current (A)', 'I-V Characteristic')
+        self._apply_axes_style()
         self._lines = []
+
+    def _xy(self, x, y):
+        return (y, x) if self._swapped else (x, y)
 
     def plot_sweep(self, voltages, currents, label='Forward', color='blue'):
         """Plot one sweep trace."""
-        line, = self.axes.plot(voltages, currents, '-o', markersize=3,
+        line, = self.axes.plot(*self._xy(voltages, currents), '-o', markersize=3,
                                color=color, label=label, linewidth=1.5)
         self._lines.append(line)
         self.axes.legend(loc='best', fontsize=8)
@@ -505,19 +516,59 @@ class IVCanvas(FigureCanvas):
         self.axes.autoscale_view(True, True, True)
         self.draw_idle()
 
-    def set_labels(self, xlabel, ylabel, title):
-        self.axes.set_xlabel(xlabel)
-        self.axes.set_ylabel(ylabel)
-        self.axes.set_title(title)
+    def start_live_trace(self, label='Forward', color='blue'):
+        """Begin an empty trace that grows via append_live_point()."""
+        line, = self.axes.plot([], [], '-o', markersize=3,
+                               color=color, label=label, linewidth=1.5)
+        self._lines.append(line)
+        self._live_line = line
+        self._live_x, self._live_y = [], []
+        self.axes.legend(loc='best', fontsize=8)
+
+    def append_live_point(self, x, y):
+        """Add a point to the live trace; the redraw is coalesced by draw_idle."""
+        self._live_x.append(x)
+        self._live_y.append(y)
+        self._live_line.set_data(*self._xy(self._live_x, self._live_y))
+        self.axes.relim()
+        self.axes.autoscale_view(True, True, True)
         self.draw_idle()
+
+    def set_labels(self, xlabel, ylabel, title):
+        self._labels = (xlabel, ylabel, title)
+        self._apply_axes_style()
+        self.draw_idle()
+
+    def set_swapped(self, swapped: bool):
+        swapped = bool(swapped)
+        if swapped != self._swapped:
+            self._swapped = swapped
+            for line in self._lines:
+                x, y = line.get_data()
+                line.set_data(y, x)
+            self.axes.relim()
+            self.axes.autoscale_view(True, True, True)
+        self._apply_axes_style()
+        self.draw_idle()
+
+    def _apply_axes_style(self):
+        xlabel, ylabel, title = self._labels
+        if self._swapped:
+            xlabel, ylabel = ylabel, xlabel
+        for axis, label, set_label in ((self.axes.xaxis, xlabel, self.axes.set_xlabel),
+                                       (self.axes.yaxis, ylabel, self.axes.set_ylabel)):
+            m = re.match(r"^(.*?)\s*\(([^)]*)\)\s*$", label)
+            name, unit = (m.group(1), m.group(2)) if m else (label, '')
+            set_label(name)
+            axis.set_major_formatter(EngFormatter(unit=unit, places=None, sep=' '))
+        self.axes.set_title(title)
+        self.axes.grid(True)
 
     def clear_plot(self):
         for line in self._lines:
             line.remove()
         self._lines.clear()
         self.axes.clear()
-        self.axes.set_xlabel('Voltage (V)')
-        self.axes.set_ylabel('Current (A)')
-        self.axes.set_title('I-V Characteristic')
-        self.axes.grid(True)
+        self._labels = ('Voltage (V)', 'Current (A)', 'I-V Characteristic')
+        self._apply_axes_style()
         self.draw_idle()

@@ -26,12 +26,14 @@ from ..workers import MeasurementWorker, VdpMeasurementWorker
 from .canvas import HistogramCanvas, IVCanvas, PgLiveCanvas
 from .widgets import EngineeringSpinBox, NoScrollSpinBox, NoScrollIntSpinBox, VdpSampleDiagram, VdpProtocolFilmstrip, VdpPerGeometryBarChart, format_engineering, format_readout_html, format_with_uncertainty, precision_for_nplc
 from .dialogs import SettingsDialog, UserSelectionDialog
+from .sweep_tab_ext import SweepTabMixin
 
 
-class ResistanceMeterApp(QMainWindow):
+class ResistanceMeterApp(SweepTabMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.config_manager = ConfigManager()
+        self._init_instrument_memory()
         self.data_buffers = {
             'resistance': EnhancedDataBuffer(),
             'source_v': EnhancedDataBuffer(),
@@ -921,16 +923,8 @@ class ResistanceMeterApp(QMainWindow):
             "Compliance", widget.sweep_compliance,
         ))
 
-        widget.sweep_delay = NoScrollSpinBox(decimals=3, minimum=0.0, maximum=10.0, singleStep=0.01, suffix=" s")
-        widget.sweep_delay.setValue(0.01)
-        widget.sweep_delay.setToolTip("Source delay per step — time for DUT to settle after each step.\n0.01s is typical. Increase for capacitive DUTs.")
-        widget.sweep_nplc = NoScrollSpinBox(decimals=2, minimum=0.01, maximum=10.0, singleStep=0.1)
-        widget.sweep_nplc.setValue(1.0)
-        widget.sweep_nplc.setToolTip("NPLC for each measurement point in the sweep.")
-        param_layout.addRow(*self._form_pair(
-            "Step Delay", widget.sweep_delay,
-            "NPLC", widget.sweep_nplc,
-        ))
+        # Settle / measure / pause / live + limits and plan preview
+        self._build_sweep_timing_rows(widget, param_layout)
 
         # Points preview + Test Connection on one row
         widget.sweep_points_label = QLabel("Points: 21")
@@ -955,6 +949,7 @@ class ResistanceMeterApp(QMainWindow):
         toolbar = NavigationToolbar(widget.iv_canvas, self)
         plot_layout.addWidget(toolbar)
         plot_layout.addWidget(widget.iv_canvas)
+        self._build_sweep_plot_options(widget, plot_layout)
 
         # Live readout + Control row (shared chrome). Sweep uses a smaller
         # readout font because the message ("41 points acquired") is long, and
@@ -986,6 +981,7 @@ class ResistanceMeterApp(QMainWindow):
         widget.start_button.clicked.connect(lambda: self.start_measurement('sweep'))
         widget.stop_button.clicked.connect(self.stop_current_measurement)
 
+        self._update_sweep_limits(widget)
         return widget
 
     def _update_sweep_labels(self):
@@ -1004,6 +1000,7 @@ class ResistanceMeterApp(QMainWindow):
                 box._display_value()
             w.sweep_compliance._unit = 'V'
             w.sweep_compliance._display_value()
+        self._update_sweep_limits()
 
     def _update_sweep_points(self):
         """Update sweep points preview label."""
@@ -1020,6 +1017,7 @@ class ResistanceMeterApp(QMainWindow):
             w.sweep_points_label.setText(f"Points: {points} × 2 = {points * 2} (forward + reverse)")
         else:
             w.sweep_points_label.setText(f"Points: {points}")
+        self._update_sweep_plan_preview()
 
     # =========================================================================
     # Van der Pauw tab (ASTM F76 Method A)
@@ -2017,8 +2015,8 @@ class ResistanceMeterApp(QMainWindow):
                 m_cfg['sweep_stop'] = widget.sweep_stop.value()
                 m_cfg['sweep_step'] = widget.sweep_step.value()
                 m_cfg['sweep_compliance'] = widget.sweep_compliance.value()
-                m_cfg['sweep_delay'] = widget.sweep_delay.value()
                 m_cfg['sweep_direction'] = widget.sweep_direction.currentText()
+                m_cfg.update(self._sweep_settings_from_ui(widget))
             elif mode == 'vdp':
                 m_cfg['vdp_current'] = widget.vdp_current.value()
                 m_cfg['vdp_voltage_compliance'] = widget.vdp_voltage_compliance.value()
@@ -2071,6 +2069,7 @@ class ResistanceMeterApp(QMainWindow):
         to "2400" if the worker emits an empty string.
         """
         self._active_model_name = model_name or "2400"
+        self._remember_instrument(model_name)
 
     def _running_status_message(self, mode: str) -> str:
         """Build the status-bar 'Measurement running' string, with the
@@ -2190,6 +2189,8 @@ class ResistanceMeterApp(QMainWindow):
             return
         if not self._confirm_voltage_safety(mode):
             return
+        if mode == 'sweep' and not self._sweep_preflight_ok():
+            return
         widget = self.get_widget_for_mode(mode)
         if not widget:
             self.log_status(f"Error: Could not find UI for mode {mode}"); return
@@ -2207,6 +2208,7 @@ class ResistanceMeterApp(QMainWindow):
         if mode == 'sweep':
             widget.iv_canvas.clear_plot()
             widget._sweep_trace_count = 0
+            self._on_sweep_started(widget, current_settings)
         elif mode == 'four_point':
             # 4PP visualizes via histogram + tables, no time-series MplCanvas
             self._clear_four_point_data()
@@ -2226,6 +2228,7 @@ class ResistanceMeterApp(QMainWindow):
         self.measurement_worker.autoselect_decision.connect(self.on_autoselect_decision)
         self.measurement_worker.autoselect_current_chosen.connect(self.on_autoselect_current_chosen)
         self.measurement_worker.sweep_complete.connect(self.on_sweep_complete)
+        self.measurement_worker.sweep_point.connect(self.on_sweep_point)
         self.measurement_worker.finished.connect(self.on_worker_finished)
         self.measurement_worker.start()
         # The stored default (200 ms / 5 fps) was tuned for matplotlib's
@@ -2640,18 +2643,14 @@ class ResistanceMeterApp(QMainWindow):
         colors = ['blue', 'red', 'green', 'orange', 'purple']
         color = colors[(w._sweep_trace_count - 1) % len(colors)]
         label = 'Forward' if w._sweep_trace_count == 1 else f'Reverse' if w._sweep_trace_count == 2 else f'Trace {w._sweep_trace_count}'
-        w.iv_canvas.plot_sweep(voltages, currents, label=label, color=color)
+        # Point-by-point runs already drew the trace live.
+        if not getattr(self, '_sweep_live', False):
+            x, y = self._sweep_xy(w, voltages, currents)
+            w.iv_canvas.plot_sweep(x, y, label=label, color=color)
+        self._set_sweep_axis_labels(w)
 
-        # Update labels based on source function
-        src = w.sweep_source.currentText()
-        if src == 'voltage':
-            w.iv_canvas.set_labels('Voltage (V)', 'Current (A)', 'I-V Characteristic')
-        else:
-            w.iv_canvas.set_labels('Current (A)', 'Voltage (V)', 'V-I Characteristic')
-
-        # Update live readout with summary
-        comp_count = sum(1 for c in comp_list if c != 'OK')
-        w.live_readout.setText(f"{n} points | {comp_count} in compliance" if comp_count else f"{n} points acquired")
+        # Update live readout with summary (all traces so far, incl. energy)
+        w.live_readout.setText(self._sweep_summary_text())
         self.log_status(f"Sweep trace plotted: {n} points", color="darkGreen")
 
     def on_measurement_complete(self, mode: str):
@@ -3401,9 +3400,14 @@ class ResistanceMeterApp(QMainWindow):
             except Exception:
                 pass
             idn = dev.query("*IDN?").strip()
+            try:
+                line_freq = float(dev.query(":SYST:LFR?"))
+            except Exception:
+                line_freq = None
             dev.close()
             rm.close()
-            QMessageBox.information(self, "Connection OK", f"Connected to:\n{idn}")
+            limits = self._remember_instrument_from_idn(idn, line_freq)
+            QMessageBox.information(self, "Connection OK", f"Connected to:\n{idn}\n\n{limits}")
             self.log_status(f"Connection test OK: {idn}", color="darkGreen")
             self.statusBar().showMessage(f"Connected: {idn}", 5000)
         except Exception as e:

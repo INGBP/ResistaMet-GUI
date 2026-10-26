@@ -104,7 +104,11 @@ DEFAULT_SETTINGS = {
         "sweep_stop": 1.0,                   # sweep stop value (V or A)
         "sweep_step": 0.05,                  # sweep step size (V or A)
         "sweep_compliance": 0.1,             # compliance limit (A or V)
-        "sweep_delay": 0.01,                 # source delay per step (s)
+        "sweep_delay": 0.01,                 # settle time per point before measuring (s)
+        "sweep_meas_time": 0.02,             # integration window per point (s); NPLC derived
+        "sweep_energy_limit": 0.0,           # max energy into the sample per window (J); 0 = no limit
+        "sweep_energy_window": 10.0,         # sliding window for the energy limit (s)
+        "sweep_point_by_point": True,        # live point-by-point instead of hardware sweep
         "sweep_direction": "up",             # "up", "down", or "up_down"
         # Human-touch-safety voltage warning. See resistamet_gui/safety.py
         # for the rationale (IEC 61010-1 SELV at 30 V DC). Set to 0 to
